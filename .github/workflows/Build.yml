@@ -1,0 +1,35 @@
+name: Build Java-WebSocket Dependency
+
+# Yeh action tab chalega jab aap code push karenge ya manually chalaenge
+on:
+  push:
+    branches: [ master, main ]
+  workflow_dispatch: # Isse aap phone se click karke run kar sakte hain
+
+jobs:
+  build-and-compile:
+    runs-on: ubuntu-latest
+
+    steps:
+    # 1. GitHub ke server par code download karna
+    - name: Checkout Code
+      uses: actions/checkout@v4
+
+    # 2. Server par Java Setup karna
+    - name: Set up JDK 17
+      uses: actions/setup-java@v4
+      with:
+        java-version: '17'
+        distribution: 'temurin'
+        cache: 'maven'
+
+    # 3. Code ko compile karna aur JAR file banana
+    - name: Build with Maven
+      run: mvn clean package -DskipTests
+
+    # 4. Bani hui JAR file ko GitHub par download ke liye available karwana
+    - name: Upload Compiled JAR File
+      uses: actions/upload-artifact@v4
+      with:
+        name: My-Java-WebSocket-JAR
+        path: target/*.jar
