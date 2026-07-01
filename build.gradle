@@ -1,0 +1,45 @@
+plugins {
+    id 'java'
+    id 'idea'
+    id 'maven-publish'
+}
+
+repositories {
+    mavenLocal()
+    mavenCentral()
+}
+
+group = 'org.java-websocket'
+version = '1.6.1-SNAPSHOT'
+sourceCompatibility = 1.8
+targetCompatibility = 1.8
+
+compileJava {
+    options.compilerArgs += ['-encoding', 'UTF-8']
+}
+
+javadoc {
+    options.encoding = 'UTF-8'
+}
+
+publishing {
+    publications {
+        maven(MavenPublication) {
+            groupId = project.group
+            artifactId = 'Java-WebSocket'
+            version = project.version
+
+            from components.java
+        }
+    }
+}
+
+dependencies {
+    implementation group: 'org.slf4j', name: 'slf4j-api', version: '2.0.15'
+    testImplementation group: 'org.slf4j', name: 'slf4j-simple', version: '2.0.15'
+    testImplementation group: 'org.junit.jupiter', name: 'junit-jupiter', version: '5.11.4'
+}
+
+test {
+    useJUnitPlatform()  // This is required for JUnit 5
+}
