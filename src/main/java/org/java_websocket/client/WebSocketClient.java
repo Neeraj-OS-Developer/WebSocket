@@ -79,41 +79,50 @@ public abstract class WebSocketClient extends AbstractWebSocket implements Runna
   protected URI uri = null;
 
   /**
-   * The underlying engine
+   * The underlying engine. Replaced in {@link #reset()} while the caller thread holds the
+   * visibility barrier of {@link Thread#join()}, so {@code volatile} makes reads from any other
+   * thread (e.g. UI polling {@link #getReadyState()}) consistent.
    */
-  private WebSocketImpl engine = null;
+  private volatile WebSocketImpl engine = null;
 
   /**
-   * The socket for this WebSocketClient
+   * The socket for this WebSocketClient.
+   * <p>Written by the connect/read thread, read by the write thread ({@code closeSocket()}) and
+   * by caller threads in {@link #reset()} / socket-address getters. Must be {@code volatile} to
+   * avoid a check-then-act race where the write thread sees a stale reference.
    */
-  private Socket socket = null;
+  private volatile Socket socket = null;
 
   /**
    * The SocketFactory for this WebSocketClient
    *
    * @since 1.4.0
    */
-  private SocketFactory socketFactory = null;
+  private volatile SocketFactory socketFactory = null;
 
   /**
-   * The used OutputStream
+   * The used OutputStream.
+   * <p>Written by the connect/read thread (after socket handshake), read by the write thread in a
+   * tight loop. {@code volatile} publishes the reference before the write thread is started.
    */
-  private OutputStream ostream;
+  private volatile OutputStream ostream;
 
   /**
    * The used proxy, if any
    */
-  private Proxy proxy = Proxy.NO_PROXY;
+  private volatile Proxy proxy = Proxy.NO_PROXY;
 
   /**
-   * The thread to write outgoing message
+   * The thread to write outgoing message.
+   * <p>{@code volatile} plus self-null in the write-thread {@code finally} guarantees that once
+   * this reads {@code null}, the previous write thread has completed {@code closeSocket()}.
    */
-  private Thread writeThread;
+  private volatile Thread writeThread;
 
   /**
    * The thread to connect and read message
    */
-  private Thread connectReadThread;
+  private volatile Thread connectReadThread;
 
   /**
    * The draft to use
@@ -128,12 +137,12 @@ public abstract class WebSocketClient extends AbstractWebSocket implements Runna
   /**
    * The latch for connectBlocking()
    */
-  private CountDownLatch connectLatch = new CountDownLatch(1);
+  private volatile CountDownLatch connectLatch = new CountDownLatch(1);
 
   /**
    * The latch for closeBlocking()
    */
-  private CountDownLatch closeLatch = new CountDownLatch(1);
+  private volatile CountDownLatch closeLatch = new CountDownLatch(1);
 
   /**
    * The socket timeout value to be used in milliseconds.
@@ -146,7 +155,14 @@ public abstract class WebSocketClient extends AbstractWebSocket implements Runna
    * @see InetAddress
    * @since 1.4.1
    */
-  private DnsResolver dnsResolver = null;
+  private volatile DnsResolver dnsResolver = null;
+
+  /**
+   * Guards the compare-and-set of {@link #writeThread} when a write thread terminates. Using a
+   * dedicated lock object instead of {@code this} avoids contention with any external code that
+   * might synchronize on the client instance.
+   */
+  private final Object writeThreadLock = new Object();
 
   /**
    * Constructs a WebSocketClient instance and sets it to the connect to the specified URI. The
@@ -354,28 +370,36 @@ public abstract class WebSocketClient extends AbstractWebSocket implements Runna
           "You cannot initialize a reconnect out of the websocket thread. Use reconnect in another thread to ensure a successful cleanup.");
     }
     try {
-      // This socket null check ensures we can reconnect a socket that failed to connect. It's an uncommon edge case, but we want to make sure we support it
-      if (engine.getReadyState() == ReadyState.NOT_YET_CONNECTED && socket != null) {
-        // Closing the socket when we have not connected prevents the writeThread from hanging on a write indefinitely during connection teardown
-        socket.close();
+      // Snapshot the socket: it may be nulled concurrently by the write thread on termination.
+      if (engine.getReadyState() == ReadyState.NOT_YET_CONNECTED) {
+        Socket s = socket;
+        if (s != null) {
+          s.close();
+        }
       }
       closeBlocking();
 
-      if (writeThread != null) {
-        this.writeThread.interrupt();
-        this.writeThread.join();
-        this.writeThread = null;
+      // Snapshot the thread references so a concurrent self-null cannot NPE between
+      // the null-check and the interrupt/join. Joining also publishes ostream/socket
+      // writes performed by the write thread's finally to this thread.
+      Thread wt = writeThread;
+      if (wt != null) {
+        wt.interrupt();
+        wt.join();
+        clearWriteThreadIfCurrent(wt);
       }
-      if (connectReadThread != null) {
-        this.connectReadThread.interrupt();
-        this.connectReadThread.join();
+      Thread crt = connectReadThread;
+      if (crt != null) {
+        crt.interrupt();
+        crt.join();
         this.connectReadThread = null;
       }
       this.draft.reset();
-      if (this.socket != null) {
-        this.socket.close();
-        this.socket = null;
+      Socket s = this.socket;
+      if (s != null) {
+        s.close();
       }
+      this.socket = null;
     } catch (Exception e) {
       onError(e);
       engine.closeConnection(CloseFrame.ABNORMAL_CLOSE, e.getMessage());
@@ -436,6 +460,7 @@ public abstract class WebSocketClient extends AbstractWebSocket implements Runna
    * the connection is closed use <code>closeBlocking</code>
    */
   public void close() {
+    // writeThread is self-nulled on termination, so this is a safe idempotent no-op once closed.
     if (writeThread != null) {
       engine.close(CloseFrame.NORMAL);
     }
@@ -489,6 +514,7 @@ public abstract class WebSocketClient extends AbstractWebSocket implements Runna
     engine.sendPing();
   }
 
+  @Override
   public void run() {
     InputStream istream;
     try {
@@ -501,14 +527,20 @@ public abstract class WebSocketClient extends AbstractWebSocket implements Runna
         socket.setReceiveBufferSize(receiveBufferSize);
       }
 
+      // Compute the resolved port once and reuse it for socket connect + TLS upgrade.
+      // Avoids repeated scheme dispatch inside getPort() in a hot startup path.
+      final int port = getPort();
+
       if (!socket.isConnected()) {
-        InetSocketAddress addr = dnsResolver == null ? InetSocketAddress.createUnresolved(uri.getHost(), getPort()) : new InetSocketAddress(dnsResolver.resolve(uri), this.getPort());
+        InetSocketAddress addr = dnsResolver == null
+            ? InetSocketAddress.createUnresolved(uri.getHost(), port)
+            : new InetSocketAddress(dnsResolver.resolve(uri), port);
         socket.connect(addr, connectTimeout);
       }
 
       // if the socket is set by others we don't apply any TLS wrapper
       if (upgradeSocketToSSLSocket && "wss".equals(uri.getScheme())) {
-        upgradeSocketToSSL();
+        upgradeSocketToSSL(port);
       }
 
       if (socket instanceof SSLSocket) {
@@ -522,14 +554,14 @@ public abstract class WebSocketClient extends AbstractWebSocket implements Runna
       ostream = socket.getOutputStream();
 
       sendHandshake();
-    } catch (/*IOException | SecurityException | UnresolvedAddressException | InvalidHandshakeException | ClosedByInterruptException | SocketTimeoutException */Exception e) {
+    } catch (Exception e) {
       onWebsocketError(engine, e);
       engine.closeConnection(CloseFrame.NEVER_CONNECTED, e.getMessage());
       return;
     } catch (InternalError e) {
       // https://bugs.openjdk.java.net/browse/JDK-8173620
-      if (e.getCause() instanceof InvocationTargetException && e.getCause()
-          .getCause() instanceof IOException) {
+      if (e.getCause() instanceof InvocationTargetException
+          && e.getCause().getCause() instanceof IOException) {
         IOException cause = (IOException) e.getCause().getCause();
         onWebsocketError(engine, cause);
         engine.closeConnection(CloseFrame.NEVER_CONNECTED, cause.getMessage());
@@ -552,11 +584,16 @@ public abstract class WebSocketClient extends AbstractWebSocket implements Runna
 
     int receiveBufferSize = getReceiveBufferSize();
     byte[] rawbuffer = new byte[receiveBufferSize > 0 ? receiveBufferSize : DEFAULT_READ_BUFFER_SIZE];
+    // Reuse a single ByteBuffer wrapper over the pre-allocated byte[] so that the read loop
+    // performs zero per-frame allocation. engine.decode only advances position/limit and does
+    // not retain the buffer reference, so reuse is safe.
+    ByteBuffer readBuffer = ByteBuffer.wrap(rawbuffer);
     int readBytes;
 
     try {
       while (!isClosing() && !isClosed() && (readBytes = istream.read(rawbuffer)) != -1) {
-        engine.decode(ByteBuffer.wrap(rawbuffer, 0, readBytes));
+        readBuffer.position(0).limit(readBytes);
+        engine.decode(readBuffer);
       }
       engine.eot();
     } catch (IOException e) {
@@ -568,7 +605,7 @@ public abstract class WebSocketClient extends AbstractWebSocket implements Runna
     }
   }
 
-  private void upgradeSocketToSSL()
+  private void upgradeSocketToSSL(int port)
       throws NoSuchAlgorithmException, KeyManagementException, IOException {
     SSLSocketFactory factory;
     // Prioritise the provided socketfactory
@@ -578,7 +615,7 @@ public abstract class WebSocketClient extends AbstractWebSocket implements Runna
     } else {
       factory = (SSLSocketFactory) SSLSocketFactory.getDefault();
     }
-    socket = factory.createSocket(socket, uri.getHost(), getPort(), true);
+    socket = factory.createSocket(socket, uri.getHost(), port, true);
   }
 
   private boolean prepareSocket() throws IOException {
@@ -697,8 +734,10 @@ public abstract class WebSocketClient extends AbstractWebSocket implements Runna
   @Override
   public final void onWebsocketClose(WebSocket conn, int code, String reason, boolean remote) {
     stopConnectionLostTimer();
-    if (writeThread != null) {
-      writeThread.interrupt();
+    // Snapshot to avoid a check-then-act race with the write thread's self-null.
+    Thread wt = writeThread;
+    if (wt != null) {
+      wt.interrupt();
     }
     onClose(code, reason, remote);
     connectLatch.countDown();
@@ -761,16 +800,18 @@ public abstract class WebSocketClient extends AbstractWebSocket implements Runna
 
   @Override
   public InetSocketAddress getLocalSocketAddress(WebSocket conn) {
-    if (socket != null) {
-      return (InetSocketAddress) socket.getLocalSocketAddress();
+    Socket s = socket;
+    if (s != null) {
+      return (InetSocketAddress) s.getLocalSocketAddress();
     }
     return null;
   }
 
   @Override
   public InetSocketAddress getRemoteSocketAddress(WebSocket conn) {
-    if (socket != null) {
-      return (InetSocketAddress) socket.getRemoteSocketAddress();
+    Socket s = socket;
+    if (s != null) {
+      return (InetSocketAddress) s.getRemoteSocketAddress();
     }
     return null;
   }
@@ -823,6 +864,18 @@ public abstract class WebSocketClient extends AbstractWebSocket implements Runna
     //To overwrite
   }
 
+  /**
+   * Compare-and-set that nulls {@link #writeThread} only if it still points to the calling thread.
+   * Called from the write thread's {@code finally} block <em>after</em> {@code closeSocket()} has
+   * completed, so observing {@code writeThread == null} implies the socket has been closed.
+   */
+  private void clearWriteThreadIfCurrent(Thread t) {
+    synchronized (writeThreadLock) {
+      if (writeThread == t) {
+        writeThread = null;
+      }
+    }
+  }
 
   private class WebsocketWriteThread implements Runnable {
 
@@ -840,7 +893,13 @@ public abstract class WebSocketClient extends AbstractWebSocket implements Runna
       } catch (IOException e) {
         handleIOException(e);
       } finally {
-        closeSocket();
+        try {
+          closeSocket();
+        } finally {
+          // Self-null only AFTER closeSocket() so that observers of writeThread==null are
+          // guaranteed the socket has been closed and reset() can skip join() safely.
+          webSocketClient.clearWriteThreadIfCurrent(Thread.currentThread());
+        }
       }
     }
 
@@ -866,19 +925,20 @@ public abstract class WebSocketClient extends AbstractWebSocket implements Runna
     }
 
     /**
-     * Closing the socket
+     * Closing the socket. Snapshot the field to a local so a concurrent {@link #reset()} cannot
+     * null it between the check and the close (and so we never close a newly-created socket).
      */
     private void closeSocket() {
-      try {
-        if (socket != null) {
-          socket.close();
+      Socket s = socket;
+      if (s != null) {
+        try {
+          s.close();
+        } catch (IOException ex) {
+          onWebsocketError(webSocketClient, ex);
         }
-      } catch (IOException ex) {
-        onWebsocketError(webSocketClient, ex);
       }
     }
   }
-
 
   /**
    * Method to set a proxy for this connection
@@ -1003,7 +1063,7 @@ public abstract class WebSocketClient extends AbstractWebSocket implements Runna
       throw new IllegalArgumentException(
           "This websocket uses ws instead of wss. No SSLSession available.");
     }
-    return ((SSLSocket)socket).getSession();
+    return ((SSLSocket) socket).getSession();
   }
 
   @Override
